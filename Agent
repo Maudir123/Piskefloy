@@ -1,0 +1,384 @@
+# ───────────────────────────────────────────────────────────
+# Block 1 – Core-Logic & LLM-Integration (Mistral 3B)
+# ───────────────────────────────────────────────────────────
+import sqlite3
+import threading
+import time
+from datetime import datetime
+import json
+import requests
+
+import numpy as np
+import pandas as pd
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+
+# ══ Konfiguration ════════════════════════════════════════
+API_KEY               = "DEIN_BINANCE_API_KEY"
+API_SECRET            = "DEIN_BINANCE_API_SECRET"
+DB_FILE               = "trading_ai.db"
+
+FIXED_FRACTION        = 0.05
+MAX_DRAWDOWN_PER_DAY  = 0.05
+SCHEDULE_INTERVAL_MIN = 15
+
+RSI_INTERVAL          = "15m"
+RSI_THRESH            = 70
+MIN_VOL24H            = 500_000
+AUTO_SCORE_THRESH     = 50.0
+AUTO_SYMBOL_LIMIT     = 100
+AUTO_ENTRY_BUFFER_PCT = 0.2
+
+# ══ Einfache Caches für Binance-Rate-Limits ═══════════════
+_ACCOUNT_CACHE = {"time": 0, "equity": 0.0}
+_TICKER_CACHE  = {"time": 0, "data": []}
+CACHE_TTL      = 60  # Sekunden
+
+def get_24h_ticker():
+    now = time.time()
+    if now - _TICKER_CACHE["time"] < CACHE_TTL:
+        return _TICKER_CACHE["data"]
+    data = client.get_ticker_24hr()
+    _TICKER_CACHE.update(time=now, data=data)
+    return data
+
+def get_account_equity_usdt():
+    now = time.time()
+    if now - _ACCOUNT_CACHE["time"] < CACHE_TTL:
+        return _ACCOUNT_CACHE["equity"]
+    total = 0.0
+    try:
+        balances = client.get_account()["balances"]
+    except BinanceAPIException as e:
+        print("❌ Account fetch error:", e)
+        return 0.0
+    for b in balances:
+        amt = float(b["free"]) + float(b["locked"])
+        if amt <= 0:
+            continue
+        if b["asset"] == "USDT":
+            total += amt
+        else:
+            try:
+                price = float(client.get_symbol_ticker(symbol=b["asset"]+"USDT")["price"])
+                total += amt * price
+            except BinanceAPIException:
+                pass
+    _ACCOUNT_CACHE.update(time=now, equity=total)
+    return total
+
+# ══ LLM-Integration (Mistral 3B lokal) ══════════════════
+LLM_API_URL = "http://[Log in to view URL]:5000/v1/chat/completions"
+MODEL_NAME  = "mistral-3b"
+
+functions = [
+    {
+        "name": "place_order",
+        "description": "Plaziere einen Trade auf Binance",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "side":   {"type": "string", "enum": ["BUY","SELL"]},
+                "qty":    {"type": "number"}
+            },
+            "required": ["symbol","side","qty"]
+        }
+    }
+]
+
+def call_local_mistral(prompt: str, functions=functions):
+    payload = {
+        "model": MODEL_NAME,
+        "messages":[
+            {"role":"system","content":"Du bist ein Trading-Bot."},
+            {"role":"user","content":prompt}
+        ],
+        "functions":     functions,
+        "function_call": "auto",
+        "max_tokens":    200,
+        "temperature":   0.2
+    }
+    try:
+        r = requests.post(LLM_API_URL, json=payload, timeout=5)
+        r.raise_for_status()
+        msg = r.json()["choices"][0]["message"]
+    except Exception as e:
+        print("❌ LLM call/parsing error:", e)
+        return None
+
+    if msg.get("function_call"):
+        fn   = msg["function_call"]["name"]
+        args = json.loads(msg["function_call"]["arguments"])
+        try:
+            return globals()[fn](**args)
+        except Exception as e:
+            print("❌ Function dispatch error:", e)
+            return None
+    return msg.get("content")
+
+# ══ Binance-Client & Datenbank ════════════════════════════
+client = Client(API_KEY, API_SECRET)
+
+def init_db():
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT,
+            symbol TEXT,
+            side TEXT,
+            qty REAL,
+            entry REAL,
+            sl REAL,
+            tp REAL,
+            method TEXT
+        );
+        CREATE TABLE IF NOT EXISTS equity (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT,
+            equity REAL
+        );
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT,
+            message TEXT
+        );
+        CREATE TABLE IF NOT EXISTS safety_log (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT,
+            symbol TEXT,
+            reason TEXT,
+            volatility REAL,
+            age_minutes REAL
+        );
+        """)
+    print("✅ Database initialized")
+
+def log_trade(symbol, side, qty, entry, sl, tp, method):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            "INSERT INTO trades (timestamp,symbol,side,qty,entry,sl,tp,method) "
+            "VALUES (datetime('now'),?,?,?,?,?,?,?)",
+            (symbol, side, qty, entry, sl, tp, method)
+        )
+
+def log_equity(value):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            "INSERT INTO equity (timestamp,equity) VALUES (datetime('now'),?)",
+            (value,)
+        )
+
+def log_alert(message):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            "INSERT INTO alerts (timestamp,message) VALUES (datetime('now'),?)",
+            (message,)
+        )
+    print("⚠️ Alert:", message)
+
+def log_safety_event(symbol, reason, volatility, age_minutes):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            "INSERT INTO safety_log "
+            "(timestamp,symbol,reason,volatility,age_minutes) "
+            "VALUES (datetime('now'),?,?,?,?)",
+            (symbol, reason, volatility, age_minutes)
+        )
+
+# ══ Risk-Management & Cleanup ════════════════════════════
+def risk_based_order_cleanup(threshold_volatility=5.0, max_age_minutes=15):
+    try:
+        open_orders = client.get_open_orders()
+    except BinanceAPIException as e:
+        print("❌ Open orders fetch error:", e)
+        return
+
+    orders_by_symbol = {}
+    for o in open_orders:
+        orders_by_symbol.setdefault(o["symbol"], []).append(o)
+
+    for sym, orders in orders_by_symbol.items():
+        df  = fetch_latest_ohlcv(sym, RSI_INTERVAL)
+        vol = calculate_volatility(df)
+        for o in orders:
+            age = (datetime.utcnow() - datetime.fromtimestamp(o["time"]/1000)) \
+                  .total_seconds() / 60
+            if vol >= threshold_volatility or age >= max_age_minutes:
+                try:
+                    client.cancel_order(symbol=sym, orderId=o["orderId"])
+                    reason = "Hohe Volatilität" if vol>=threshold_volatility else "Alte Order"
+                    msg = f"Risk Cleanup: {sym}#{o['orderId']} ({reason}), Vol={vol:.2f}%, Age={age:.1f}m"
+                    print("🛡️", msg)
+                    log_alert(msg)
+                    log_safety_event(sym, reason, vol, age)
+                except BinanceAPIException as e:
+                    print("❌ Cancel error:", e)
+
+def scheduled_check():
+    try:
+        get_account_equity_usdt()
+    except Exception as e:
+        log_alert(str(e))
+
+# ══ Order-Placement, Signale & Scheduler ─────────────────
+def place_order_with_risk(...): 
+    ...  # unverändert
+
+def fetch_latest_ohlcv(...): 
+    ...  # unverändert
+
+def compute_rsi(...):    
+    ...  # unverändert
+
+def calculate_volatility(...): 
+    ...  # unverändert
+
+def calculate_trend_score(...): 
+    ...  # unverändert
+
+def scan_symbols_with_ranking(...):
+    ...  # unverändert
+
+def auto_execute_best_trade(): 
+    ...  # unverändert
+
+def start_scheduler():
+    threading.Thread(
+        target=lambda: (
+            scheduled_check(),
+            risk_based_order_cleanup(),
+            time.sleep(SCHEDULE_INTERVAL_MIN*60),
+            ),
+        daemon=True
+    ).start()
+
+def start_auto_trade_scheduler():
+    threading.Thread(
+        target=lambda: (
+            auto_execute_best_trade(),
+            time.sleep(SCHEDULE_INTERVAL_MIN*60),
+            ),
+        daemon=True
+    ).start()
+
+if __name__ == "__main__":
+    init_db()
+    start_scheduler()
+    start_auto_trade_scheduler()
+
+
+# ───────────────────────────────────────────────────────────
+# Block 2 – Streamlit Dashboard & UI
+# ───────────────────────────────────────────────────────────
+import streamlit as st
+import sqlite3
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import ast
+
+# DB_FILE wird im Modul-Scope definiert
+from __main__ import DB_FILE
+
+# Scheduler-Guard für Hot-Reload
+if not st.session_state.get("scheduler_started", False):
+    init_db()
+    start_scheduler()
+    start_auto_trade_scheduler()
+    st.session_state.scheduler_started = True
+
+st.sidebar.title("⚙️ Einstellungen")
+lang     = st.sidebar.radio("Sprache / Language", ["Deutsch", "English"])
+method   = st.sidebar.selectbox("Methode / Method", ["fixed", "kelly"])
+sl_pct   = st.sidebar.slider("Stop-Loss %", 0.5, 10.0, 1.5, 0.1)
+tp_pct   = st.sidebar.slider("Take-Profit %", 0.5, 10.0, 3.0, 0.1)
+win_rate = st.sidebar.slider("Win-Rate", 0.3, 0.9, 0.55, 0.01)
+wl_ratio = st.sidebar.slider("Win/Loss Ratio", 1.0, 5.0, 2.0, 0.1)
+st.session_state.update(
+    lang=lang, method=method, sl_pct=sl_pct,
+    tp_pct=tp_pct, win_rate=win_rate, wl_ratio=wl_ratio
+)
+
+def txt(de, en):
+    return de if st.session_state.lang == "Deutsch" else en
+
+st.title(txt("📈 Trading AI Dashboard","📈 Trading AI Dashboard"))
+
+col1, col2 = st.columns(2)
+with col1:
+    st.subheader(txt("Letzte Trades","Recent Trades"))
+    with sqlite3.connect(DB_FILE) as conn:
+        df_t = pd.read_sql("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 20", conn)
+    st.dataframe(df_t)
+
+    st.subheader(txt("Manueller Schnell-Trade","Manual Quick Trade"))
+    sym   = st.text_input("Symbol","BTCUSDT")
+    entry = st.number_input("Entry", 27000.0)
+    side  = st.selectbox("Side",["BUY","SELL"])
+    if st.button(txt("Trade platzieren","Place Trade")):
+        place_order_with_risk(
+            sym, side, entry,
+            st.session_state.method,
+            st.session_state.win_rate,
+            st.session_state.wl_ratio,
+            st.session_state.sl_pct,
+            st.session_state.tp_pct
+        )
+        st.success(txt("Trade ausgeführt","Trade executed"))
+
+with col2:
+    st.subheader(txt("Equity Verlauf","Equity History"))
+    with sqlite3.connect(DB_FILE) as conn:
+        df_e = pd.read_sql("SELECT * FROM equity ORDER BY timestamp DESC", conn)
+    st.line_chart(df_e.set_index("timestamp")["equity"])
+
+    st.subheader(txt("Benachrichtigungen","Alerts"))
+    with sqlite3.connect(DB_FILE) as conn:
+        df_a = pd.read_sql("SELECT * FROM alerts ORDER BY timestamp DESC LIMIT 10", conn)
+    for _, r in df_a.iterrows():
+        st.warning(f"{r['timestamp']}: {r['message']}")
+
+st.subheader(txt("📡 RSI-Signale","📡 RSI-Signals"))
+df_s = pd.DataFrame(scan_symbols_with_ranking()).head(20)
+st.table(df_s)
+
+st.subheader(txt("🛡️ Safety Log & Risk-Level","🛡️ Safety Log & Risk-Level"))
+with sqlite3.connect(DB_FILE) as conn:
+    df_sl = pd.read_sql("SELECT * FROM safety_log ORDER BY timestamp DESC LIMIT 10", conn)
+if not df_sl.empty:
+    for _, r in df_sl.iterrows():
+        st.warning(f"{r['timestamp']} | {r['symbol']} | {r['reason']} | Vol {r['volatility']:.2f}% | Age {r['age_minutes']:.1f}m")
+    fig, ax = plt.subplots(figsize=(8,4))
+    scatter = ax.scatter(
+        df_sl["volatility"], df_sl["age_minutes"],
+        s=np.clip(df_sl["volatility"]*df_sl["age_minutes"]/5, 5, 200),
+        c=df_sl["volatility"]*df_sl["age_minutes"], cmap="coolwarm", alpha=0.7
+    )
+    plt.colorbar(scatter, label="Risk Score")
+    ax.set_xlabel("Volatilität (%)"); ax.set_ylabel("Order-Alter (Minuten)")
+    ax.set_title(txt("Risk-Level Chart","Risk-Level Chart"))
+    st.pyplot(fig)
+else:
+    st.success(txt("Keine kritischen Löschungen","No safety events"))
+
+st.subheader(txt("🔢 Taschenrechner","🔢 Calculator"))
+expr = st.text_input(txt("Ausdruck","Expression"), "")
+if expr:
+    try:
+        res = ast.literal_eval(expr)
+        st.write(txt("Ergebnis","Result"), res)
+    except Exception as e:
+        st.error(txt("Ungültiger Ausdruck","Invalid expression")+f": {e}")
+
+st.subheader(txt("🤖 Trading-LLM Prompt","🤖 Trading-LLM Prompt"))
+prompt = st.text_area(txt("Dein Prompt hier…","Your prompt here…"), "")
+if st.button(txt("Run Prompt","Run Prompt")):
+    out = call_local_mistral(prompt)
+    if out is not None:
+        st.write(out)
+    else:
+        st.error(txt("LLM call failed","Fehler beim LLM-Aufruf"))
+```
